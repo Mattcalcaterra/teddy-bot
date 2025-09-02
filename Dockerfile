@@ -13,8 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
 COPY src ./src
-# optional: include default creed list (or mount it via volume at runtime)
-# COPY creed.txt ./creed.txt
+COPY creed.txt ./creed.txt
+COPY cookie.txt ./cookie.txt
 
 # Drop root
 RUN useradd -m bot && chown -R bot:bot /app
