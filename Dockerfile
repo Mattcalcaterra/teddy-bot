@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
 COPY src ./src
+RUN ls
 COPY creed.txt ./creed.txt
 COPY cookies.txt ./cookies.txt
 
