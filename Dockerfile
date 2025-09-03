@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App code
 COPY src ./src
-COPY creed.txt ./creed.txt
+COPY creed.txt /app/creed.txt
 
 # Drop root
 RUN useradd -m bot && chown -R bot:bot /app
