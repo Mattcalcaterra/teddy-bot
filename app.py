@@ -8,10 +8,22 @@ import asyncio
 import requests
 import os
 
+# --- NEW: stdlib imports used by fingerprinting ---
+import tempfile
+import shutil
+import subprocess
+import json
+from contextlib import contextmanager
+from typing import Optional, Tuple, Dict, Any
+
 # ——— CONFIG ———
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
+# NEW: AcoustID client key for audio fingerprinting (https://acoustid.org/api-key)
+ACOUSTID_API_KEY = os.getenv("ACOUSTID_API_KEY")
+# NEW: clip length (seconds) for fingerprinting; we’ll seek into the track (not from 0s)
+FINGERPRINT_CLIP_SECONDS = int(os.getenv("FP_CLIP_SECONDS", "28"))
 
-# ——— Bot & FFmpeg/YT‑DLP setup ———
+# ——— Bot & FFmpeg/YT-DLP setup ———
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command = None)
@@ -50,33 +62,50 @@ def split_artist_track(full_title: str):
         return parts[0].strip(), parts[1].strip()
     return "", full_title.strip()
 
+# NEW: strip common YouTube noise from titles before heuristic parsing
+def normalize_title_noise(s: str) -> str:
+    """Strip common YouTube noise tokens from a title."""
+    s = re.sub(r"\s*\[[^\]]*\]\s*", " ", s)     # [Official Video], [Lyrics]
+    s = re.sub(r"\s*\([^\)]*\)\s*", " ", s)     # (Official Audio), (HD)
+    s = re.sub(r"(?i)\b(official video|official audio|lyrics|hd|4k|remastered|mv|music video)\b", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" -_|·–— ").strip()
+
+# CHANGED: HTTPS + tighter guards
 def get_similar_lastfm(artist: str, track: str, limit: int = 5):
     """
     Call Last.fm track.getSimilar to return up to `limit` similar tracks.
     Returns list of dicts: {'artist': artist, 'name': track_name}.
     """
     print("Artist:" + artist, "track: "+track)
-    resp = requests.get(
-        "http://ws.audioscrobbler.com/2.0/",
-        params={
-            'method': 'track.getSimilar',
-            'artist': artist,
-            'track': track,
-            'api_key': LASTFM_API_KEY,
-            'format': 'json',
-            'limit': limit
-        },
-        timeout=5
-    )
-    data = resp.json()
+    if not LASTFM_API_KEY:
+        return []
+    try:
+        resp = requests.get(
+            "https://ws.audioscrobbler.com/2.0/",
+            params={
+                'method': 'track.getSimilar',
+                'artist': artist,
+                'track': track,
+                'api_key': LASTFM_API_KEY,
+                'format': 'json',
+                'limit': max(1, min(50, int(limit))),
+                'autocorrect': 1
+            },
+            timeout=7
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
 
     entries = data.get("similartracks", {}).get("track", [])
     results = []
     for t in entries:
         name = t.get("name")
-        art  = t.get("artist", {}).get("name")
+        art  = (t.get("artist") or {}).get("name")
         if name and art:
-            results.append({'artist': art, 'name': name})
+            results.append({'artist': art.strip(), 'name': name.strip()})
     return results
 
 def search_youtube(query: str):
@@ -94,6 +123,159 @@ def get_youtube_audio(url: str):
 
 def is_youtube_url(q: str):
     return re.match(r"(https?://)?(www\.)?(youtube|youtu|youtube\-nocookie)\.(com|be)/.+", q, re.IGNORECASE)
+
+# --- NEW: fingerprinting utilities (reuse the current stream; do NOT redownload with yt-dlp) ---
+
+@contextmanager
+def _tempfile(suffix: str = ""):
+    path = tempfile.mktemp(prefix="fp_", suffix=suffix)
+    try:
+        yield path
+    finally:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+def _choose_fingerprint_window(total_duration: Optional[int], clip_len: int) -> int:
+    """
+    Pick a start offset that avoids very beginning (often silence/skits).
+    Strategy:
+      - If duration known: start at max(30s, 25% of track), but keep 5s headroom.
+      - Else: default to 60s.
+    """
+    if total_duration and total_duration > (clip_len + 10):
+        start = max(30, int(total_duration * 0.25))
+        # keep some tail room
+        max_start = max(0, total_duration - clip_len - 5)
+        return min(start, max_start)
+    return 60
+
+def _extract_clip_from_stream(stream_url: str, start_sec: int, clip_len: int) -> str:
+    """
+    Use ffmpeg to read directly from the remote audio stream URL and write a short WAV clip.
+    Returns the path to the clip.
+    """
+    with _tempfile(suffix=".wav") as out_wav:
+        # Build ffmpeg command; -ss before -i for fast seek; include reconnect flags for robustness
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-nostdin",
+            "-loglevel", "error",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-ss", str(start_sec),
+            "-i", stream_url,
+            "-t", str(clip_len),
+            "-vn",
+            "-ac", "2",
+            "-ar", "44100",
+            out_wav,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0 or not os.path.exists(out_wav) or os.path.getsize(out_wav) == 0:
+            raise RuntimeError(proc.stderr.strip() or "ffmpeg failed to extract clip")
+        # Copy to a stable temp path we return (so context manager won't delete it yet)
+        final_path = tempfile.mktemp(prefix="clip_", suffix=".wav")
+        shutil.copy2(out_wav, final_path)
+    return final_path
+
+def _run_fpcalc_json(file_path: str) -> Dict[str, Any]:
+    """
+    Run Chromaprint fpcalc with JSON output; returns dict with 'duration' and 'fingerprint'.
+    """
+    try:
+        proc = subprocess.run(
+            ["fpcalc", "-json", file_path],
+            capture_output=True, text=True, timeout=20
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "fpcalc failed")
+        return json.loads(proc.stdout)
+    except FileNotFoundError:
+        raise RuntimeError("fpcalc (Chromaprint) not found on PATH.")
+    except Exception as e:
+        raise RuntimeError(f"Fingerprinting failed: {e}")
+
+def _acoustid_lookup_best(fingerprint: str, duration: int) -> Optional[Dict[str, Any]]:
+    """
+    Query AcoustID; return best match dict: {artist, title, mbid, score}
+    """
+    if not ACOUSTID_API_KEY:
+        return None
+    try:
+        r = requests.get(
+            "https://api.acoustid.org/v2/lookup",
+            params={
+                "client": ACOUSTID_API_KEY,
+                "meta": "recordings+recordingids+releasegroups+sources+artists",
+                "fingerprint": fingerprint,
+                "duration": int(duration),
+            },
+            timeout=8
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return None
+
+    best = None
+    for res in data.get("results", []):
+        res_score = float(res.get("score", 0.0))
+        for rec in res.get("recordings", []):
+            title = rec.get("title")
+            mbid  = rec.get("id")
+            artists = rec.get("artists", [])
+            artist_name = (artists[0].get("name").strip() if artists else None)
+            if artist_name and title:
+                cand = {"artist": artist_name.strip(), "title": title.strip(), "mbid": mbid, "score": res_score}
+                if (best is None) or (cand["score"] > best["score"]):
+                    best = cand
+    return best
+
+async def identify_current_by_fingerprint(ctx, url: str, clip_len: int = FINGERPRINT_CLIP_SECONDS
+) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Identify a YouTube track by reusing the current audio stream URL and fingerprinting a mid-song clip.
+    Returns (artist, title, meta) or (None, None, None) if not confident.
+    """
+    # Get stream URL (no second yt-dlp download), and total duration if possible
+    total_duration = None
+    try:
+        info = ytdl.extract_info(url, download=False)
+        total_duration = info.get("duration")
+    except Exception:
+        total_duration = None
+
+    stream_url = get_youtube_audio(url)
+    if not stream_url:
+        return None, None, None
+
+    start_sec = _choose_fingerprint_window(total_duration, clip_len)
+
+    await ctx.send(f"🔎 Identifying from audio…")
+    clip_path = None
+    try:
+        clip_path = _extract_clip_from_stream(stream_url, start_sec, clip_len)
+        fp = _run_fpcalc_json(clip_path)
+        fingerprint = fp.get("fingerprint")
+        duration = int(fp.get("duration", clip_len))
+        if not fingerprint:
+            return None, None, None
+        best = _acoustid_lookup_best(fingerprint, duration)
+        if not best:
+            return None, None, None
+        return best["artist"], best["title"], {"mbid": best.get("mbid"), "score": best.get("score")}
+    except Exception as e:
+        print(f"[identify] {e}")
+        return None, None, None
+    finally:
+        if clip_path and os.path.exists(clip_path):
+            try: os.remove(clip_path)
+            except: pass
 
 # ——— Music Queue ———
 class MusicQueue:
@@ -141,7 +323,7 @@ inactivity_check.counter = 0
 async def on_ready():
     inactivity_check.start()
 
-# ——— Auto‑Join Helper ———
+# ——— Auto-Join Helper ———
 async def ensure_voice(ctx):
     if not ctx.voice_client:
         if not ctx.author.voice:
@@ -173,6 +355,7 @@ async def help_command(ctx):
         ),
         inline=False
     )
+    # (Optional) You can add a help line for !identify if you want.
     await ctx.send(embed=embed)
 
 
@@ -237,6 +420,21 @@ async def creed(ctx):
     except FileNotFoundError:
         await ctx.send("creed.txt not found.")
 
+# NEW: handy identify command (optional but useful for debugging/UX)
+@bot.command()
+async def identify(ctx):
+    """
+    Identify the currently playing YouTube track via audio fingerprinting (mid-song clip).
+    """
+    if not music_queue.current:
+        return await ctx.send("No track is currently playing.")
+    artist, title, meta = await identify_current_by_fingerprint(ctx, music_queue.current)
+    if artist and title:
+        conf = f" (score {meta['score']:.2f})" if meta and meta.get("score") is not None else ""
+        await ctx.send(f"✅ Detected: **{artist} – {title}**{conf}")
+    else:
+        await ctx.send("❌ Couldn't confidently identify this track.")
+
 @bot.command()
 async def playlist(ctx, *args):
     """
@@ -257,21 +455,38 @@ async def playlist(ctx, *args):
     if not music_queue.current:
         return await ctx.send("No track is currently playing.")
 
-    # 3) Determine artist & track, with manual override
+    # 3) Determine artist & track, with manual override → title parse → fingerprint fallback (prefers fingerprint)
     manual = " ".join(arglist).strip()
+    artist = track = None
+
     if manual:
         if " - " not in manual:
             return await ctx.send("If you supply artist/track manually, use `Artist - Track` format.")
         artist, track = manual.split(" - ", 1)
         artist, track = artist.strip(), track.strip()
     else:
-        # Extract from the YouTube title
-        info       = ytdl.extract_info(music_queue.current, download=False)
-        full_title = info.get("title", "")
-        artist, track = split_artist_track(full_title)
+        # Try to parse from YouTube title first
+        try:
+            info       = ytdl.extract_info(music_queue.current, download=False)
+            full_title = normalize_title_noise(info.get("title", "") or "")
+        except Exception:
+            full_title = ""
+        a_guess, t_guess = split_artist_track(full_title)
+
+        # Prefer accurate path: fingerprint a mid-song clip from the *current stream url*
+        fp_artist = fp_title = None
+        fp_meta = None
+        fp_artist, fp_title, fp_meta = await identify_current_by_fingerprint(ctx, music_queue.current)
+
+        # Use fingerprint if confident or if title parse is weak
+        if fp_artist and fp_title and (not a_guess or not t_guess or (fp_meta and fp_meta.get("score", 0) >= 0.5)):
+            artist, track = fp_artist, fp_title
+        else:
+            artist, track = a_guess, t_guess
+
         if not track:
             return await ctx.send(
-                "Couldn't parse artist and track from the title.  "
+                "Couldn't parse or identify artist/track. "
                 "You can retry with `!playlist Artist - Track`."
             )
 
@@ -363,5 +578,3 @@ async def queue(ctx):
 
 # Run the bot
 bot.run(os.getenv("DISCORD_TOKEN"))
-
-
