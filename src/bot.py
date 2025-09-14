@@ -19,30 +19,11 @@ from contextlib import contextmanager
 from typing import Optional, Tuple, Dict, Any
 
 # ——— CONFIG ———
-<<<<<<< HEAD:app.py
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
 # NEW: AcoustID client key for audio fingerprinting (https://acoustid.org/api-key)
 ACOUSTID_API_KEY = os.getenv("ACOUSTID_API_KEY")
 # NEW: clip length (seconds) for fingerprinting; we’ll seek into the track (not from 0s)
 FINGERPRINT_CLIP_SECONDS = int(os.getenv("FP_CLIP_SECONDS", "28"))
-=======
-def get_token():
-    t = os.getenv("DISCORD_TOKEN")
-    tf = os.getenv("DISCORD_TOKEN_FILE")
-    if not t and tf and Path(tf).exists():
-        t = Path(tf).read_text().strip()
-    return t
-
-def get_lastfm_key():
-    key = os.getenv("LASTFM_API_KEY")
-    if not key:
-        f = os.getenv("LASTFM_API_KEY_FILE")
-        if f and Path(f).exists():
-            key = Path(f).read_text().strip()
-    return key
-
-LASTFM_API_KEY = get_lastfm_key()
->>>>>>> 09901dcb989595e637a3108c9b823d17e03f968f:src/bot.py
 
 # ——— Bot & FFmpeg/YT-DLP setup ———
 intents = discord.Intents.default()
@@ -598,10 +579,6 @@ async def queue(ctx):
 
 
 # Run the bot
-<<<<<<< HEAD:app.py
-bot.run(os.getenv("DISCORD_TOKEN"))
-=======
 bot.run(get_token())
 
 
->>>>>>> 09901dcb989595e637a3108c9b823d17e03f968f:src/bot.py
