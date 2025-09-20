@@ -584,6 +584,6 @@ def get_token():
     return os.getenv("DISCORD_TOKEN")
 
 # Run the bot
-bot.run(os.getenv("DISCORD_TOKEN"))
+bot.run(get_token())
 
 
