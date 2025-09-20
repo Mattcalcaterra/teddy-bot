@@ -576,7 +576,12 @@ async def queue(ctx):
 
     await ctx.send(embed=embed)
 
-
+def get_token():
+    token_file = os.getenv("DISCORD_TOKEN_FILE")
+    if token_file and os.path.exists(token_file):
+        with open(token_file, "r") as f:
+            return f.read().strip()
+    return os.getenv("DISCORD_TOKEN")
 
 # Run the bot
 bot.run(get_token())
