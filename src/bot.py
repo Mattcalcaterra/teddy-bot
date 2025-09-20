@@ -579,6 +579,6 @@ async def queue(ctx):
 
 
 # Run the bot
-bot.run(get_token())
+bot.run(os.getenv("DISCORD_TOKEN"))
 
 
